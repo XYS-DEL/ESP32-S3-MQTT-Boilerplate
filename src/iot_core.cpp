@@ -1,6 +1,7 @@
 // src/iot_core.cpp
 #include "iot_core.h"
 #include "config.h"
+#include "hal_sensor.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -142,8 +143,10 @@ void publishStatus() {
     
     // 写数据
     doc["uptime"] = millis() / 1000;
-    doc["rssi"] = WiFi.RSSI(); // 信号强度
-    doc["status"] = "online"; // 状态信息
+    doc["rssi"]   = WiFi.RSSI(); // 信号强度
+    doc["status"] = "online_OTA_V2"; // 状态信息
+    doc["temp"]   = readInternalTemp(); // cpu温度
+    doc["ip"]     = WiFi.localIP().toString();
 
     char buffer[200]; // 定义数组接收
     
