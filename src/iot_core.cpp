@@ -1,8 +1,9 @@
 // src/iot_core.cpp
+#include <Arduino.h>
+#include <stdint.h>
 #include "iot_core.h"
 #include "config.h"
 #include "hal_sensor.h"
-#include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -17,13 +18,11 @@ PubSubClient client(espClient);
 Adafruit_NeoPixel rgb(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
 unsigned long lastReconnectAttempt = 0;
-unsigned long lastStatusPublish = 0;
 
 // --- 内部私有函数声明 ---
 void setupWiFi();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void connectToMQTT();
-void publishStatus();
 
 // ==========================================
 // 对外暴露的 Setup 函数
@@ -56,6 +55,7 @@ void setupIoTSystem() {
 // 对外暴露的 Loop 函数
 // ==========================================
 void loopIoTSystem() {
+  // 1. 如果断线了，执行非阻塞重连
   if (!client.connected()) {
     unsigned long now = millis();
     if (now - lastReconnectAttempt > 5000) {
@@ -63,13 +63,9 @@ void loopIoTSystem() {
       connectToMQTT(); 
     }
   } else {
+    // 2. 维持 MQTT 底层心跳和接收下发指令
+    // 发送数据全部移交给 FreeRTOS 队列处理了
     client.loop(); 
-    
-    unsigned long now = millis();
-    if (now - lastStatusPublish > 10000) {
-      lastStatusPublish = now;
-      publishStatus();
-    }
   }
 }
 
@@ -137,25 +133,37 @@ void connectToMQTT() {
     }
 }
 
-void publishStatus() {
-    // 开辟函数栈来存信息
-    StaticJsonDocument<200> doc;
+void publishStatusWithData(float temp, uint32_t freeHeap, uint32_t timestamp) {
+    StaticJsonDocument<256> doc;
     
-    // 写数据
-    doc["uptime"] = millis() / 1000;
-    doc["rssi"]   = WiFi.RSSI(); // 信号强度
-    doc["status"] = "online_OTA_V2"; // 状态信息
-    doc["temp"]   = readInternalTemp(); // cpu温度
+    doc["temp"] = serialized(String(temp, 1)); 
+    doc["heap_kb"] = freeHeap / 1024; 
+
+    uint32_t totalSeconds = timestamp / 1000;
+    uint32_t days = totalSeconds / 86400;
+    uint32_t hours = (totalSeconds % 86400) / 3600;
+    uint32_t mins = (totalSeconds % 3600) / 60;
+    uint32_t secs = totalSeconds % 60;
+    
+    char uptimeStr[32]; // 分配一个小数组来装可读的时间
+    sprintf(uptimeStr, "%dd %dh %dm %ds", days, hours, mins, secs);
+    
+    doc["uptime"] = uptimeStr;        // 时间
+    doc["uptime_sec"] = totalSeconds; // 给数据库留的纯粹数字
+
+    // 其他常规数据
+    doc["rssi"]   = WiFi.RSSI();
+    doc["status"] = "online_OTA_V2";
     doc["ip"]     = WiFi.localIP().toString();
 
-    char buffer[200]; // 定义数组接收
-    
-    serializeJson(doc, buffer); // 封装数据
+    char buffer[256]; 
+    serializeJson(doc, buffer); 
 
+    // 发布到状态主题
     boolean result = client.publish(topic_state.c_str(), buffer);
 
     if(result) {
-        Serial.print("已发布: ");
+        Serial.print("数据已推送到云端: ");
         Serial.println(buffer);
     } else {
         Serial.println("发布失败 (可能未连接)");
@@ -181,7 +189,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         return; 
     }
 
-    // 核心解析：反序列化 JSON
+    // 反序列化 JSON
     StaticJsonDocument<200> doc;
     DeserializationError error = deserializeJson(doc, messageTemp);
 
