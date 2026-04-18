@@ -12,7 +12,9 @@
 // MQTT 配置
 // ==========================================
 #define MQTT_BROKER     "broker.emqx.io" // 连接不上请使用 broker-cn.emqx.io
-#define MQTT_PORT       1883
+#define MQTT_PORT        8883         //MQTTS加密端口
+// 证书字符组，自行去官网 https://www.emqx.com/zh/mqtt-dashboard 或者使用命令行 openssl s_client -connect broker.emqx.io:8883 -showcerts 获取
+extern const char* root_ca;
 
 // ==========================================
 // 硬件引脚配置

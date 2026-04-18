@@ -5,14 +5,46 @@
 #include "config.h"
 #include "hal_sensor.h"
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
+#include <time.h>
 
 // --- 全局变量声明  ---
+const char* root_ca = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIEfjCCA2agAwIBAgIQD+Ayq4RNAzEGxQyOE8iwaDANBgkqhkiG9w0BAQsFADBh
+MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaWNlcnQgSW5jMRkwFwYDVQQLExB3
+d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBD
+QTAeFw0yNDAxMTgwMDAwMDBaFw0zMTExMDkyMzU5NTlaMGExCzAJBgNVBAYTAlVT
+MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j
+b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEcyMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuzfNNNx7a8myaJCtSnX/RrohCgiN9RlUyfuI
+2/Ou8jqJkTx65qsGGmvPrC3oXgkkRLpimn7Wo6h+4FR1IAWsULecYxpsMNzaHxmx
+1x7e/dfgy5SDN67sH0NO3Xss0r0upS/kqbitOtSZpLYl6ZtrAGCSYP9PIUkY92eQ
+q2EGnI/yuum06ZIya7XzV+hdG82MHauVBJVJ8zUtluNJbd134/tJS7SsVQepj5Wz
+tCO7TG1F8PapspUwtP1MVYwnSlcUfIKdzXOS0xZKBgyMUNGPHgm+F6HmIcr9g+UQ
+vIOlCsRnKPZzFBQ9RnbDhxSJITRNrw9FDKZJobq7nMWxM4MphQIDAQABo4IBMDCC
+ASwwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUTiJUIBiV5uNu5g/6+rkS7QYX
+jzkwHwYDVR0jBBgwFoAUA95QNVbRTLtm8KPiGxvDl7I90VUwDgYDVR0PAQH/BAQD
+AgGGMHQGCCsGAQUFBwEBBGgwZjAjBggrBgEFBQcwAYYXaHR0cDovL29jc3AuZGln
+aWNlcnQuY24wPwYIKwYBBQUHMAKGM2h0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNu
+L0RpZ2lDZXJ0R2xvYmFsUm9vdENBLmNydDBABgNVHR8EOTA3MDWgM6Axhi9odHRw
+Oi8vY3JsLmRpZ2ljZXJ0LmNuL0RpZ2lDZXJ0R2xvYmFsUm9vdENBLmNybDARBgNV
+HSAECjAIMAYGBFUdIAAwDQYJKoZIhvcNAQELBQADggEBAHRBl3jN7+XHBUK0dZnu
+hMdoNwD1nCROU3BTIh1TNzRI0bQ0m5+C/dCRzzlqoSAFHUlOi+OiDltWkXTzmQn6
+Z8bH5PFBy5sYpc/8cNPoSzhyqcpvvEZvv/Ivc0Up+dzma7vBDJC9WrMRUUlSFSQp
+kdXSmphDNkXJsgARmxzc18IN6LYMRiOWlY7RE2F900pPW60BvJHHNCX0bbSRj/Ql
+bmVq8wuftBD++D+RS8K++ujpMjFBROyWfBX+woQDGsMazkmgulQdnZrdj476elOL
+axRvrSgEorju1kJM7M65z2RUZrfzQYW/1rs8mRUXin6iEtad/Rv1ZI1WGYmWPyBm
+pbo=
+-----END CERTIFICATE-----
+)EOF";
+
 String clientId, topic_state, topic_command;
 
-WiFiClient espClient;
+WiFiClientSecure espClient; 
 PubSubClient client(espClient);
 
 Adafruit_NeoPixel rgb(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
@@ -84,6 +116,17 @@ void setupWiFi() {
 
     Serial.print(" 正在连接 WiFi... ");
 
+    Serial.print(" 正在同步网络时间(NTP)...");
+    configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov"); // 东八区时间
+
+    time_t now = time(nullptr);
+    while (now < 24 * 3600) { // 如果时间还没同步成功（小于一天）
+        delay(500);
+        Serial.print(".");
+        now = time(nullptr);
+    }
+    Serial.println(" 时间同步完成！");
+
     while(WiFi.status() != WL_CONNECTED) {
         Serial.print(".");
         delay(1000);
@@ -93,9 +136,12 @@ void setupWiFi() {
         }
     }
 
-        Serial.println(" WiFi 连接成功！");
-        Serial.print(" IP 地址为: ");
-        Serial.println(WiFi.localIP());
+    Serial.println(" WiFi 连接成功！");
+    Serial.print(" IP 地址为: ");
+    Serial.println(WiFi.localIP());
+
+    espClient.setCACert(root_ca);
+    Serial.println("TLS/SSL 根证书已加载，准备进行加密握手...");
 }
 
 void connectToMQTT() {
