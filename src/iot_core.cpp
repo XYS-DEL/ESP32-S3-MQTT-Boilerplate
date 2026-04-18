@@ -10,8 +10,9 @@
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
 #include <time.h>
+#include <LittleFS.h>
 
-// --- 全局变量声明  ---
+// --- 全局变量声明 ---
 const char* root_ca = R"EOF(
 -----BEGIN CERTIFICATE-----
 MIIEfjCCA2agAwIBAgIQD+Ayq4RNAzEGxQyOE8iwaDANBgkqhkiG9w0BAQsFADBh
@@ -43,62 +44,106 @@ pbo=
 )EOF";
 
 String clientId, topic_state, topic_command;
+// 文件缓存位置与熔断值
+const char* CACHE_FILE = "/data_cache.log";
+const size_t MAX_CACHE_SIZE = 512 * 1024;
 
 WiFiClientSecure espClient; 
 PubSubClient client(espClient);
 
 Adafruit_NeoPixel rgb(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
+// 状态机全局控制变量
 unsigned long lastReconnectAttempt = 0;
+int mqttRetryCount = 0; // 用于记录 MQTT 连续失败次数
 
 // --- 内部私有函数声明 ---
 void setupWiFi();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void connectToMQTT();
+void saveToCache(const char* data);
+void publishCachedData();
 
 // ==========================================
 // 对外暴露的 Setup 函数
 // ==========================================
 void setupIoTSystem() {
-  rgb.begin();
-  rgb.setPixelColor(0, rgb.Color(0, 0, 0));
-  rgb.show();
+    rgb.begin();
+    rgb.setPixelColor(0, rgb.Color(0, 0, 0));
+    rgb.show();
 
-  setupWiFi();
+    if(!LittleFS.begin(true)) { 
+        Serial.println("LittleFS 挂载失败！");
+        return;
+    }
+    Serial.println("LittleFS 本地文件系统挂载成功！");
 
-  String mac = WiFi.macAddress();
+    setupWiFi();
 
-  // 去除mac地址的：,符合mqtt的规范
-  mac.replace(":", ""); 
+    String mac = WiFi.macAddress();
+    mac.replace(":", ""); 
 
-  clientId = "ESP32S3-" + mac;
-  topic_state = "device/esp32s3/" + clientId + "/state";
-  topic_command = "device/esp32s3/" + clientId + "/command";
+    clientId = "ESP32S3-" + mac;
+    topic_state = "device/esp32s3/" + clientId + "/state";
+    topic_command = "device/esp32s3/" + clientId + "/command";
 
-  Serial.println("\n--- MQTT Topic ---");
-  Serial.println("状态上报: " + topic_state);
-  Serial.println("命令下发: " + topic_command);
+    Serial.println("\n--- MQTT Topic ---");
+    Serial.println("状态上报: " + topic_state);
+    Serial.println("命令下发: " + topic_command);
 
-  client.setServer(MQTT_BROKER, MQTT_PORT);
-  client.setCallback(mqttCallback);
+    client.setServer(MQTT_BROKER, MQTT_PORT);
+    client.setCallback(mqttCallback);
+
+    // 协议栈保活与超时配置
+    client.setKeepAlive(5); 
+    client.setSocketTimeout(5);
 }
 
 // ==========================================
 // 对外暴露的 Loop 函数
 // ==========================================
 void loopIoTSystem() {
-  // 1. 如果断线了，执行非阻塞重连
-  if (!client.connected()) {
     unsigned long now = millis();
-    if (now - lastReconnectAttempt > 5000) {
-      lastReconnectAttempt = now;
-      connectToMQTT(); 
+
+    // 第一层守护：检查物理底层的 Wi-Fi 状态
+    if (WiFi.status() != WL_CONNECTED) {
+        if (now - lastReconnectAttempt > 5000) {
+            lastReconnectAttempt = now;
+            Serial.println("物理网络(Wi-Fi)已断开，正在尝试重新连接...");
+            WiFi.reconnect(); 
+        }
+        return; 
     }
-  } else {
-    // 2. 维持 MQTT 底层心跳和接收下发指令
-    // 发送数据全部移交给 FreeRTOS 队列处理了
-    client.loop(); 
-  }
+
+    // 第二层守护：Wi-Fi 正常，检查上层的 MQTT 状态
+    if (!client.connected()) {
+        if (now - lastReconnectAttempt > 5000) { 
+            lastReconnectAttempt = now;
+            mqttRetryCount++; // 失败次数累加
+            
+            Serial.print("Wi-Fi 正常，尝试重连 MQTT (第 ");
+            Serial.print(mqttRetryCount);
+            Serial.println(" 次)...");
+            
+            connectToMQTT(); 
+
+            // 核心防御：连续 6 次连接失败，触发 lwIP 协议栈重置
+            if (mqttRetryCount >= 6) {
+                Serial.println("协议栈假死！执行网络重置...");
+                
+                WiFi.disconnect(true, true); // 彻底抹除底层状态
+                delay(500); 
+                WiFi.mode(WIFI_STA);
+                WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // 重新发起 L2/L3 握手
+                
+                mqttRetryCount = 0; 
+            }
+        }
+    } else {
+        // 第三层：一切正常，清零计数器，维持心跳
+        mqttRetryCount = 0; 
+        client.loop(); 
+    }
 }
 
 // ==========================================
@@ -107,20 +152,21 @@ void loopIoTSystem() {
 
 void setupWiFi() {
     int i = 0;
-
-    WiFi.disconnect(true,true);
+    WiFi.setSleep(false);
+    WiFi.disconnect(true, true);
     delay(100);
 
-    WiFi.mode(WIFI_STA); // 强制锁定STA模式
-    WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+    WiFi.mode(WIFI_STA); 
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     Serial.print(" 正在连接 WiFi... ");
 
+    // NTP 时间同步（TLS 前置条件）
     Serial.print(" 正在同步网络时间(NTP)...");
-    configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov"); // 东八区时间
+    configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov"); 
 
     time_t now = time(nullptr);
-    while (now < 24 * 3600) { // 如果时间还没同步成功（小于一天）
+    while (now < 24 * 3600) { 
         delay(500);
         Serial.print(".");
         now = time(nullptr);
@@ -130,7 +176,7 @@ void setupWiFi() {
     while(WiFi.status() != WL_CONNECTED) {
         Serial.print(".");
         delay(1000);
-        if(++i >= 10) {
+        if(++i >= 15) { // 稍微延长等待时间，防止路由器响应慢
             Serial.println("连接超时！请检查 WiFi 状况！");
             return;
         }
@@ -147,31 +193,29 @@ void setupWiFi() {
 void connectToMQTT() {
     Serial.print("尝试连接 MQTT Broker...");
     
-    //  准备好的内容
     String willPayload = "{\"status\": \"offline\"}";
     
-    //  发起连接
-    // 参数顺口溜：ID、账号、密码、遗嘱主题、QoS、Retain、遗嘱内容
     boolean success = client.connect(
-        clientId.c_str(),    // 使用动态生成的 ID
-        NULL,                // 公共服务器无账号
-        NULL,                // 公共服务器无密码
-        topic_state.c_str(), // 遗嘱发到状态主题
-        0,                   // QoS 0 
-        true,                //  必须为 true！这样别人一上线就能看到你挂了
-        willPayload.c_str()  // 遗嘱内容
+        clientId.c_str(),    
+        NULL,                
+        NULL,                
+        topic_state.c_str(), 
+        0,                   
+        true,                // 开启遗嘱 Retain
+        willPayload.c_str()  
     );
 
     if (success) {
         Serial.println(" 连接成功！");
 
-        // 亲自发布第一条“上线声明”，并开启 Retain
         String onlinePayload = "{\"status\": \"online\"}";
         client.publish(topic_state.c_str(), onlinePayload.c_str(), true);
 
-        // 订阅指令主题，准备接收手机端的命令
         client.subscribe(topic_command.c_str());
         Serial.println(" 已订阅指令主题: " + topic_command);
+
+        // 连上之后第一件事：查水表，补发断网数据
+        publishCachedData();
 
     } else {
         Serial.print(" 失败，错误码：");
@@ -191,13 +235,12 @@ void publishStatusWithData(float temp, uint32_t freeHeap, uint32_t timestamp) {
     uint32_t mins = (totalSeconds % 3600) / 60;
     uint32_t secs = totalSeconds % 60;
     
-    char uptimeStr[32]; // 分配一个小数组来装可读的时间
+    char uptimeStr[32]; 
     sprintf(uptimeStr, "%dd %dh %dm %ds", days, hours, mins, secs);
     
-    doc["uptime"] = uptimeStr;        // 时间
-    doc["uptime_sec"] = totalSeconds; // 给数据库留的纯粹数字
+    doc["uptime"] = uptimeStr;        
+    doc["uptime_sec"] = totalSeconds; 
 
-    // 其他常规数据
     doc["rssi"]   = WiFi.RSSI();
     doc["status"] = "online_OTA_V2";
     doc["ip"]     = WiFi.localIP().toString();
@@ -205,14 +248,19 @@ void publishStatusWithData(float temp, uint32_t freeHeap, uint32_t timestamp) {
     char buffer[256]; 
     serializeJson(doc, buffer); 
 
-    // 发布到状态主题
-    boolean result = client.publish(topic_state.c_str(), buffer);
-
-    if(result) {
-        Serial.print("数据已推送到云端: ");
-        Serial.println(buffer);
+    // 智能路由（有网发云，无网写盘）
+    if(client.connected()) {
+        boolean result = client.publish(topic_state.c_str(), buffer);
+        if(result) {
+            Serial.print("数据已推送到云端: ");
+            Serial.println(buffer);
+        } else {
+            Serial.println("发布失败，转入本地缓存...");
+            saveToCache(buffer); 
+        }
     } else {
-        Serial.println("发布失败 (可能未连接)");
+        Serial.println("当前处于断网状态，启动离线存储...");
+        saveToCache(buffer);
     }
 }
 
@@ -221,43 +269,89 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.print(topic);
     Serial.print("] 的指令: ");
 
-    // 这里的 payload 是 byte 数组（二进制流），不是字符串
-    // 所以不能直接打印，也不能直接给 JSON 库用
     String messageTemp;
     for (int i = 0; i < length; i++) {
         messageTemp += (char)payload[i];
     }
     Serial.println(messageTemp);
 
-    // 身份校验：虽然只订阅了 command，为了安全性验证一下主题
-    // 如果订阅多个topic必须验证！
     if (String(topic) != topic_command) {
         return; 
     }
 
-    // 反序列化 JSON
     StaticJsonDocument<200> doc;
     DeserializationError error = deserializeJson(doc, messageTemp);
 
     if (error) {
-        Serial.print(" JSON 解析失败: ");
+        Serial.print("JSON 解析失败: ");
         Serial.println(error.f_str());
         return;
     }
 
-    // 业务逻辑与容错：确保 JSON 里真的包含 r, g, b 这三个键
     if (doc.containsKey("r") && doc.containsKey("g") && doc.containsKey("b")) {
-        // 取出数值
         int r = doc["r"];
         int g = doc["g"];
         int b = doc["b"];
 
-        // 驱动底层硬件
         rgb.setPixelColor(0, rgb.Color(r, g, b));
         rgb.show();
         
-        Serial.printf(" RGB 硬件已更新 -> R:%d, G:%d, B:%d\n", r, g, b);
+        Serial.printf("RGB 硬件已更新 -> R:%d, G:%d, B:%d\n", r, g, b);
     } else {
-        Serial.println(" 格式错误：指令中缺少 r, g, b 参数！");
+        Serial.println("格式错误：指令中缺少 r, g, b 参数！");
     }
+}
+
+void saveToCache(const char* data) {
+    File file = LittleFS.open(CACHE_FILE, FILE_APPEND);
+    if (!file) {
+        Serial.println("无法打开缓存文件进行写入");
+        return;
+    }
+
+    if (file.size() > MAX_CACHE_SIZE) {
+        file.close();
+        LittleFS.remove(CACHE_FILE); 
+        Serial.println("缓存容量触顶 (512KB)！已清空历史沉淀，重新开始记录最新数据。");
+        
+        file = LittleFS.open(CACHE_FILE, FILE_WRITE);
+        if (!file) {
+            Serial.println("重建缓存文件失败！");
+            return;
+        }
+    }
+
+    file.println(data);
+    file.close();
+    Serial.println("数据已安全存入本地 Flash 缓存！");
+}
+
+void publishCachedData() {
+    if (!LittleFS.exists(CACHE_FILE)) {
+        return; 
+    }
+
+    File file = LittleFS.open(CACHE_FILE, FILE_READ);
+    if (!file) {
+        Serial.println("无法读取缓存文件");
+        return;
+    }
+
+    Serial.println("网络恢复！开始补发历史断网数据...");
+    int count = 0;
+    
+    while (file.available()) {
+        String line = file.readStringUntil('\n'); 
+        line.trim(); 
+        
+        if (line.length() > 0) {
+            client.publish(topic_state.c_str(), line.c_str());
+            count++;
+            delay(50); 
+        }
+    }
+    file.close();
+    
+    LittleFS.remove(CACHE_FILE); 
+    Serial.printf("历史缓存清理完毕，共补发了 %d 条数据，文件已销毁。\n", count);
 }
