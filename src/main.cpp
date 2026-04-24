@@ -4,7 +4,6 @@
 #include "hal_sensor.h"
 #include "sys_ota.h"
 
-extern String clientId;
 
 struct SensorPayload {
     float temperature;  // CPU温度
@@ -52,7 +51,6 @@ void Task_Network(void *pvParameters) {
     Serial.printf("网络任务运行在核心: %d\n", xPortGetCoreID());
 
     setupIoTSystem(); 
-    setupOTA(clientId);
 
     for (;;) {
         loopIoTSystem(); // 维持 MQTT 心跳
