@@ -4,5 +4,6 @@
 
 void setupOTA(const String& hostname);
 void loopOTA();
+void triggerWanFOTA(const String& downloadUrl);
 
 #endif

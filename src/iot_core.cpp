@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "iot_core.h"
 #include "config.h"
+#include "sys_ota.h"
 #include "hal_sensor.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -87,6 +88,8 @@ void setupIoTSystem() {
     topic_state = "device/esp32s3/" + clientId + "/state";
     topic_command = "device/esp32s3/" + clientId + "/command";
 
+    setupOTA(clientId);
+
     Serial.println("\n--- MQTT Topic ---");
     Serial.println("状态上报: " + topic_state);
     Serial.println("命令下发: " + topic_command);
@@ -95,14 +98,15 @@ void setupIoTSystem() {
     client.setCallback(mqttCallback);
 
     // 协议栈保活与超时配置
-    client.setKeepAlive(5); 
-    client.setSocketTimeout(5);
+    client.setKeepAlive(45); 
+    client.setSocketTimeout(15);
 }
 
 // ==========================================
 // 对外暴露的 Loop 函数
 // ==========================================
 void loopIoTSystem() {
+    loopOTA();
     unsigned long now = millis();
 
     // 第一层守护：检查物理底层的 Wi-Fi 状态
@@ -141,7 +145,7 @@ void loopIoTSystem() {
         }
     } else {
         // 第三层：一切正常，清零计数器，维持心跳
-        mqttRetryCount = 0; 
+        mqttRetryCount = 0;
         client.loop(); 
     }
 }
@@ -286,6 +290,13 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         Serial.print("JSON 解析失败: ");
         Serial.println(error.f_str());
         return;
+    }
+
+    // 路由分发：拦截并交给 OTA 模块处理
+    if (doc["cmd"] == "ota") {
+        String url = doc["url"].as<String>();
+        triggerWanFOTA(url); 
+        return; 
     }
 
     if (doc.containsKey("r") && doc.containsKey("g") && doc.containsKey("b")) {
